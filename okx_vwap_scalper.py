@@ -41,6 +41,12 @@ ENABLE_TOPN_SCAN = os.getenv("ENABLE_TOPN_SCAN", "true").lower() == "true"
 TOPN = int(os.getenv("TOPN", "40"))
 QUOTE_FILTER = os.getenv("QUOTE_FILTER", "USDT")
 
+# --- Debug scanning & test trade ---
+DEBUG_LOG_TOPN = os.getenv("DEBUG_LOG_TOPN", "true").lower() == "true"
+SCAN_REFRESH_SEC = int(os.getenv("SCAN_REFRESH_SEC", "300"))  # default 5m
+DEBUG_FORCE_TRADE = os.getenv("DEBUG_FORCE_TRADE", "false").lower() == "true"
+DEBUG_FORCE_MARGIN_USDT = float(os.getenv("DEBUG_FORCE_MARGIN_USDT", "0"))  # e.g. 10 → notional 10*x10
+
 SYMBOL = os.getenv("OKX_SYMBOL", "BTC/USDT:USDT")  # fallback / default
 TIMEFRAME = os.getenv("OKX_TIMEFRAME", "5m")
 LEVERAGE = int(os.getenv("OKX_LEVERAGE", "10"))
@@ -259,10 +265,10 @@ def size_from_risk(ex: ccxt.Exchange, symbol: str, entry_px: float, sl_px: float
     return max(amount, min_amt)
 
 # ---------------------- ORDER HELPERS ----------------------
-def place_entry(ex: ccxt.Exchange, symbol: str, side: str, amount: float, last_px: float):
+def place_entry(ex: ccxt.Exchange, symbol: str, side: str, amount: float, last_px: float, force_market: bool=False):
     order_side = "buy" if side == "long" else "sell"
     params = {"tdMode": "isolated" if ISOLATED else "cross", "reduceOnly": False, "lever": str(LEVERAGE)}
-    if ENTRY_TYPE == "limit":
+    if (ENTRY_TYPE == "limit") and (not force_market):
         price = last_px * (1 - ENTRY_OFFSET_PCT) if side=="long" else last_px * (1 + ENTRY_OFFSET_PCT)
         price = float(ex.price_to_precision(symbol, price))
         params["postOnly"] = True if MAKER_ENTRY else False
@@ -389,12 +395,14 @@ def run_loop():
             pass_allowed = not (DAILY_MAX_LOSS_USDT>0 and store.data["daily_net_usdt"] <= -abs(DAILY_MAX_LOSS_USDT))
             if now_ms() < (store.data.get("cooldown_until") or 0): pass_allowed = False
 
-            # If flat: scan watchlist (refresh every 5 minutes)
+            # If flat: scan watchlist (refresh every SCAN_REFRESH_SEC)
             pos_symbol = store.data['pos']['symbol'] or SYMBOL
             in_pos, pos_side, pos_amt = has_open_position(ex, pos_symbol)
             if (not in_pos) and pass_allowed and (store.data["pos"]["entry_order_id"] is None):
-                if ENABLE_TOPN_SCAN and (now_ms() - last_scan > 5*60*1000 or len(symbols_scan)==1):
+                if ENABLE_TOPN_SCAN and (now_ms() - last_scan > SCAN_REFRESH_SEC*1000 or len(symbols_scan)==1):
                     symbols_scan = topn_symbols_okx(ex, TOPN, QUOTE_FILTER); last_scan = now_ms()
+                    if DEBUG_LOG_TOPN:
+                        print("[scan] TopN:", ", ".join(symbols_scan[:min(15, len(symbols_scan))]), "...")
 
                 selected = None; side = None; row = row_prev = None; last_px = None
                 for sym in symbols_scan:
@@ -403,6 +411,8 @@ def run_loop():
                         ind = compute_indicators(df).dropna()
                         r_prev, r = ind.iloc[-2], ind.iloc[-1]
                         s = entry_signal(r_prev, r)
+                        if DEBUG_LOG_TOPN:
+                            print(f"[scan] {sym} signal={s}")
                         # lockout on direction
                         if s:
                             lk = store.data.get("lock_until", {"long":0,"short":0})
@@ -410,6 +420,37 @@ def run_loop():
                                 selected, side, row_prev, row = sym, s, r_prev, r
                                 last_px = float(r['close'])
                                 break
+                    except Exception as e:
+                        continue
+
+                # No signal but want to confirm flow -> force a tiny market trade for testing
+                if (not selected) and DEBUG_FORCE_TRADE and len(symbols_scan) > 0:
+                    selected = symbols_scan[0]
+                    try:
+                        df = fetch_ohlcv_df(ex, selected, TIMEFRAME, limit=60)
+                        ind = compute_indicators(df).dropna()
+                        r_prev, r = ind.iloc[-2], ind.iloc[-1]
+                        side = "long" if r['ema_fast'] >= r_prev['ema_fast'] else "short"
+                        last_px = float(r['close'])
+                        row = r
+                        if DEBUG_FORCE_MARGIN_USDT > 0:
+                            amt = (DEBUG_FORCE_MARGIN_USDT * LEVERAGE) / last_px
+                        else:
+                            amt = (FIXED_MARGIN_USDT * LEVERAGE) / last_px * 0.1  # 10% of normal
+                        min_amt = ex.markets[selected]['limits']['amount'].get('min') or 0
+                        amount = max(min_amt, float(ex.amount_to_precision(selected, amt)))
+                        order_id, entry_price = place_entry(ex, selected, side, amount, last_px, force_market=True)
+                        store.data['pos']['symbol'] = selected
+                        store.data["pos"].update({"side":side, "size":amount, "entry_price":entry_price,
+                                                  "tp_partial":None, "tp_main":None, "sl":entry_price,
+                                                  "partial_done":False, "entry_order_id":order_id, "entry_time":now_ms()})
+                        store.save()
+                        append_trade_log(LOG_PATH, event="plan", symbol=selected, side=side, price=last_px, size=amount,
+                                         entry_price=entry_price, sl=entry_price, tp_partial="", tp_main="",
+                                         pnl_usdt="", fees_est_usdt="", info="debug-force")
+                        print(f"[debug] Forced test trade on {selected} {side} @ {entry_price:.2f} amount={amount}")
+                        send_telegram(f"🧪 <b>صفقة اختبار</b> {selected} {side.upper()} @ {entry_price:.2f} (DEBUG_FORCE_TRADE)")
+                        continue
                     except Exception as e:
                         continue
 
