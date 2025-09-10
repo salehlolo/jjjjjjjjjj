@@ -20,6 +20,10 @@ Env adds (besides previous):
 - TOPN=40
 - QUOTE_FILTER=USDT
 """
+# .env:
+# ENABLE_TOPN_SCAN=true
+# TOPN=40
+# QUOTE_FILTER=USDT
 import os, time, math, csv, json, traceback
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, List
