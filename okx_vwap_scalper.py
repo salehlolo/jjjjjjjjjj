@@ -20,6 +20,10 @@ Env adds (besides previous):
 - TOPN=40
 - QUOTE_FILTER=USDT
 """
+# .env:
+# ENABLE_TOPN_SCAN=true
+# TOPN=40
+# QUOTE_FILTER=USDT
 import os, time, math, csv, json, traceback
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, List
@@ -36,6 +40,16 @@ load_dotenv(override=True)
 ENABLE_TOPN_SCAN = os.getenv("ENABLE_TOPN_SCAN", "true").lower() == "true"
 TOPN = int(os.getenv("TOPN", "40"))
 QUOTE_FILTER = os.getenv("QUOTE_FILTER", "USDT")
+
+# --- Debug scanning & test trade ---
+DEBUG_LOG_TOPN = os.getenv("DEBUG_LOG_TOPN", "true").lower() == "true"
+SCAN_REFRESH_SEC = int(os.getenv("SCAN_REFRESH_SEC", "300"))  # default 5m
+DEBUG_FORCE_TRADE = os.getenv("DEBUG_FORCE_TRADE", "false").lower() == "true"
+DEBUG_FORCE_MARGIN_USDT = float(os.getenv("DEBUG_FORCE_MARGIN_USDT", "0"))  # e.g. 10 → notional 10*x10
+# --- Entry diagnostics & fallbacks ---
+DEBUG_ENTRY_DIAG = os.getenv("DEBUG_ENTRY_DIAG", "true").lower() == "true"
+ENTRY_RETRY_MARKET_ON_REJECT = os.getenv("ENTRY_RETRY_MARKET_ON_REJECT", "true").lower() == "true"
+ENTRY_RETRY_MARKET_IF_STALE = os.getenv("ENTRY_RETRY_MARKET_IF_STALE", "true").lower() == "true"
 
 SYMBOL = os.getenv("OKX_SYMBOL", "BTC/USDT:USDT")  # fallback / default
 TIMEFRAME = os.getenv("OKX_TIMEFRAME", "5m")
@@ -255,15 +269,24 @@ def size_from_risk(ex: ccxt.Exchange, symbol: str, entry_px: float, sl_px: float
     return max(amount, min_amt)
 
 # ---------------------- ORDER HELPERS ----------------------
-def place_entry(ex: ccxt.Exchange, symbol: str, side: str, amount: float, last_px: float):
+def place_entry(ex: ccxt.Exchange, symbol: str, side: str, amount: float, last_px: float, force_market: bool=False):
     order_side = "buy" if side == "long" else "sell"
     params = {"tdMode": "isolated" if ISOLATED else "cross", "reduceOnly": False, "lever": str(LEVERAGE)}
-    if ENTRY_TYPE == "limit":
+    if (ENTRY_TYPE == "limit") and (not force_market):
         price = last_px * (1 - ENTRY_OFFSET_PCT) if side=="long" else last_px * (1 + ENTRY_OFFSET_PCT)
         price = float(ex.price_to_precision(symbol, price))
         params["postOnly"] = True if MAKER_ENTRY else False
-        o = ex.create_order(symbol, "limit", order_side, amount, price, params)
-        return o['id'], price
+        try:
+            o = ex.create_order(symbol, "limit", order_side, amount, price, params)
+            return o['id'], price
+        except Exception as e:
+            print(f"[entry] limit rejected {symbol} {side} amt={amount} price={price} -> {e}")
+            if ENTRY_RETRY_MARKET_ON_REJECT:
+                print("[entry] retrying as MARKET...")
+                o = ex.create_order(symbol, "market", order_side, amount, None, params)
+                avg = float(o.get('average') or last_px)
+                return o['id'], avg
+            raise
     else:
         o = ex.create_order(symbol, "market", order_side, amount, None, params)
         avg = float(o.get('average') or last_px); return o['id'], avg
@@ -310,7 +333,7 @@ def estimate_fees_usdt(entry_price, exit_price, amount, maker=True):
 
 def append_trade_log(path, **row):
     ensure_csv_headers(path, trades_csv_headers())
-    row.setdefault("time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    row.setdefault("time", utcnow().strftime("%Y-%m-%d %H:%M:%S"))
     with open(path, "a", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=trades_csv_headers()).writerow(row)
 
@@ -327,7 +350,7 @@ def append_hourly_csv(trades, wins, losses, net, net_pct, best, worst, fees):
     ensure_csv_headers(HOURLY_CSV, hourly_csv_headers())
     with open(HOURLY_CSV, "a", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=hourly_csv_headers()).writerow({
-            "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "time": utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             "trades_total": trades, "wins": wins, "losses": losses, "net_usdt": f"{net:.4f}",
             "net_pct": f"{net_pct:.4f}", "best_trade_usdt": f"{best:.4f}", "worst_trade_usdt": f"{worst:.4f}",
             "fees_est_usdt": f"{fees:.4f}"
@@ -385,12 +408,24 @@ def run_loop():
             pass_allowed = not (DAILY_MAX_LOSS_USDT>0 and store.data["daily_net_usdt"] <= -abs(DAILY_MAX_LOSS_USDT))
             if now_ms() < (store.data.get("cooldown_until") or 0): pass_allowed = False
 
-            # If flat: scan watchlist (refresh every 5 minutes)
+            # If flat: scan watchlist (refresh every SCAN_REFRESH_SEC)
             pos_symbol = store.data['pos']['symbol'] or SYMBOL
             in_pos, pos_side, pos_amt = has_open_position(ex, pos_symbol)
             if (not in_pos) and pass_allowed and (store.data["pos"]["entry_order_id"] is None):
-                if ENABLE_TOPN_SCAN and (now_ms() - last_scan > 5*60*1000 or len(symbols_scan)==1):
+                if ENABLE_TOPN_SCAN and (now_ms() - last_scan > SCAN_REFRESH_SEC*1000 or len(symbols_scan)==1):
                     symbols_scan = topn_symbols_okx(ex, TOPN, QUOTE_FILTER); last_scan = now_ms()
+                    if DEBUG_LOG_TOPN:
+                        print("[scan] TopN:", ", ".join(symbols_scan[:min(15, len(symbols_scan))]), "...")
+                elif DEBUG_ENTRY_DIAG and not ENABLE_TOPN_SCAN:
+                    print("[scan] single symbol mode:", pos_symbol)
+
+                # Entry gating diagnostics
+                if DEBUG_ENTRY_DIAG:
+                    if DAILY_MAX_LOSS_USDT > 0 and store.data["daily_net_usdt"] <= -abs(DAILY_MAX_LOSS_USDT):
+                        print(f"[skip] daily stop triggered: daily_net={store.data['daily_net_usdt']}, limit={-abs(DAILY_MAX_LOSS_USDT)}")
+                    if now_ms() < (store.data.get("cooldown_until") or 0):
+                        rem = (store.data["cooldown_until"] - now_ms())//1000
+                        print(f"[skip] cooldown active: {rem}s remaining")
 
                 selected = None; side = None; row = row_prev = None; last_px = None
                 for sym in symbols_scan:
@@ -399,6 +434,8 @@ def run_loop():
                         ind = compute_indicators(df).dropna()
                         r_prev, r = ind.iloc[-2], ind.iloc[-1]
                         s = entry_signal(r_prev, r)
+                        if DEBUG_LOG_TOPN:
+                            print(f"[scan] {sym} signal={s}")
                         # lockout on direction
                         if s:
                             lk = store.data.get("lock_until", {"long":0,"short":0})
@@ -406,6 +443,42 @@ def run_loop():
                                 selected, side, row_prev, row = sym, s, r_prev, r
                                 last_px = float(r['close'])
                                 break
+                            elif DEBUG_ENTRY_DIAG:
+                                until = lk.get(s,0)
+                                if until:
+                                    rem = (until - now_ms())//1000
+                                    print(f"[skip] lockout {s} on {sym}: {rem}s remaining")
+                    except Exception as e:
+                        continue
+
+                # No signal but want to confirm flow -> force a tiny market trade for testing
+                if (not selected) and DEBUG_FORCE_TRADE and len(symbols_scan) > 0:
+                    selected = symbols_scan[0]
+                    try:
+                        df = fetch_ohlcv_df(ex, selected, TIMEFRAME, limit=60)
+                        ind = compute_indicators(df).dropna()
+                        r_prev, r = ind.iloc[-2], ind.iloc[-1]
+                        side = "long" if r['ema_fast'] >= r_prev['ema_fast'] else "short"
+                        last_px = float(r['close'])
+                        row = r
+                        if DEBUG_FORCE_MARGIN_USDT > 0:
+                            amt = (DEBUG_FORCE_MARGIN_USDT * LEVERAGE) / last_px
+                        else:
+                            amt = (FIXED_MARGIN_USDT * LEVERAGE) / last_px * 0.1  # 10% of normal
+                        min_amt = ex.markets[selected]['limits']['amount'].get('min') or 0
+                        amount = max(min_amt, float(ex.amount_to_precision(selected, amt)))
+                        order_id, entry_price = place_entry(ex, selected, side, amount, last_px, force_market=True)
+                        store.data['pos']['symbol'] = selected
+                        store.data["pos"].update({"side":side, "size":amount, "entry_price":entry_price,
+                                                  "tp_partial":None, "tp_main":None, "sl":entry_price,
+                                                  "partial_done":False, "entry_order_id":order_id, "entry_time":now_ms()})
+                        store.save()
+                        append_trade_log(LOG_PATH, event="plan", symbol=selected, side=side, price=last_px, size=amount,
+                                         entry_price=entry_price, sl=entry_price, tp_partial="", tp_main="",
+                                         pnl_usdt="", fees_est_usdt="", info="debug-force")
+                        print(f"[debug] Forced test trade on {selected} {side} @ {entry_price:.2f} amount={amount}")
+                        send_telegram(f"🧪 <b>صفقة اختبار</b> {selected} {side.upper()} @ {entry_price:.2f} (DEBUG_FORCE_TRADE)")
+                        continue
                     except Exception as e:
                         continue
 
@@ -414,8 +487,22 @@ def run_loop():
                     store.data['pos']['symbol'] = selected; store.save()
                     sl, tp_partial, tp_main = compute_sl_tp(last_px, float(row['atr_pct']), side)
                     amount = size_from_risk(ex, selected, last_px, sl)
+                    # amount vs min check and diagnostics
+                    try:
+                        min_amt = ex.markets[selected]['limits']['amount'].get('min') or 0
+                    except Exception:
+                        min_amt = 0
+                    if DEBUG_ENTRY_DIAG:
+                        print(f"[entry] {selected} side={side} px={last_px:.4f} sl={sl:.4f} tp={tp_main:.4f} amt={amount} min_amt={min_amt}")
+                    if amount < (min_amt or 0):
+                        print(f"[skip] computed amount below min: {amount} < {min_amt}")
+                        continue
                     if amount > 0:
-                        order_id, entry_price = place_entry(ex, selected, side, amount, last_px)
+                        try:
+                            order_id, entry_price = place_entry(ex, selected, side, amount, last_px)
+                        except Exception as e:
+                            print(f"[entry] failed to place order on {selected}: {e}")
+                            continue
                         store.data["pos"].update({"side":side, "size":amount, "entry_price":entry_price, "tp_partial":tp_partial,
                                                   "tp_main":tp_main, "sl":sl, "partial_done":False, "entry_order_id":order_id, "entry_time":now_ms()})
                         store.save()
@@ -455,9 +542,23 @@ def run_loop():
                             append_trade_log(LOG_PATH, event="entry-stale-cancel", symbol=pos_symbol, side=store.data["pos"]["side"],
                                              price=current_price(ex, pos_symbol), size=0, entry_price="", sl="", tp_partial="", tp_main="",
                                              pnl_usdt="", fees_est_usdt="", info="ttl")
-                            store.data["pos"].update({"symbol":None,"side":None,"size":0.0,"entry_price":None,"tp_partial":None,"tp_main":None,"sl":None,
-                                                      "partial_done":False,"entry_order_id":None,"tp_partial_id":None,"tp_main_id":None,"sl_id":None,"entry_time":0})
-                            store.save()
+                            if ENTRY_RETRY_MARKET_IF_STALE and store.data["pos"]["side"]:
+                                try:
+                                    last_px_retry = current_price(ex, pos_symbol)
+                                    qty_retry = store.data["pos"]["size"]
+                                    print(f"[entry] stale -> retry MARKET on {pos_symbol} amt={qty_retry}")
+                                    order_id, entry_price = place_entry(ex, pos_symbol, store.data["pos"]["side"], qty_retry, last_px_retry, force_market=True)
+                                    store.data["pos"].update({"entry_price":entry_price, "entry_order_id":order_id, "entry_time":now_ms()})
+                                    store.save()
+                                except Exception as e:
+                                    print(f"[entry] retry MARKET failed: {e}")
+                                    store.data["pos"].update({"symbol":None,"side":None,"size":0.0,"entry_price":None,"tp_partial":None,"tp_main":None,"sl":None,
+                                                              "partial_done":False,"entry_order_id":None,"tp_partial_id":None,"tp_main_id":None,"sl_id":None,"entry_time":0})
+                                    store.save()
+                            else:
+                                store.data["pos"].update({"symbol":None,"side":None,"size":0.0,"entry_price":None,"tp_partial":None,"tp_main":None,"sl":None,
+                                                          "partial_done":False,"entry_order_id":None,"tp_partial_id":None,"tp_main_id":None,"sl_id":None,"entry_time":0})
+                                store.save()
                 except Exception as e: print(f"[warn] fetch_order failed: {e}")
 
             # Manage open position (client-side exits as fallback)
