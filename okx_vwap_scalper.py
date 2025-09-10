@@ -314,7 +314,7 @@ def estimate_fees_usdt(entry_price, exit_price, amount, maker=True):
 
 def append_trade_log(path, **row):
     ensure_csv_headers(path, trades_csv_headers())
-    row.setdefault("time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    row.setdefault("time", utcnow().strftime("%Y-%m-%d %H:%M:%S"))
     with open(path, "a", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=trades_csv_headers()).writerow(row)
 
@@ -331,7 +331,7 @@ def append_hourly_csv(trades, wins, losses, net, net_pct, best, worst, fees):
     ensure_csv_headers(HOURLY_CSV, hourly_csv_headers())
     with open(HOURLY_CSV, "a", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=hourly_csv_headers()).writerow({
-            "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "time": utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             "trades_total": trades, "wins": wins, "losses": losses, "net_usdt": f"{net:.4f}",
             "net_pct": f"{net_pct:.4f}", "best_trade_usdt": f"{best:.4f}", "worst_trade_usdt": f"{worst:.4f}",
             "fees_est_usdt": f"{fees:.4f}"
